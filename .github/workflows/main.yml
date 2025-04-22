@@ -1,169 +1,100 @@
-# .github/workflows/recover-realmedia.yml
-name: Recover RealMedia from .ram
+# .github/workflows/download-mixcloud-mp3.yml
+name: Download Mixcloud Track as MP3 with Cover
 
 on:
   workflow_dispatch:
     inputs:
-      ram_url:
-        description: 'ダウンロードしたい .ram ファイルの URL（オリジナル or Wayback URL）'
+      mixcloud_url:
+        description: 'Mixcloud でダウンロードしたいトラックの URL'
         required: true
-      use_waybackpack:
-        description: '全スナップショットを waybackpack で取得する場合は true'
-        required: false
-        default: 'false'
       push_to_repo:
-        description: 'ダウンロードしたメディアをリポジトリにコミット＆プッシュする場合は true'
+        description: '生成した MP3 をリポジトリにコミット＆プッシュする場合は true'
         required: false
         default: 'false'
 
 jobs:
-  recover:
+  download:
     runs-on: ubuntu-latest
     steps:
+      # 1. リポジトリをチェックアウト（コミット用に認証情報保持）
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
           persist-credentials: true
 
+      # 2. タイトルを取得して出力用に保存
+      - name: Extract track title
+        id: get_title
+        run: |
+          TITLE=$(yt-dlp --no-playlist --get-title "${{ github.event.inputs.mixcloud_url }}")
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+
+      # 3. yt-dlp と ffmpeg をインストール
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq
+          sudo apt-get install -y ffmpeg
           python3 -m pip install --upgrade pip
-          pip install waybackpack
+          pip install yt-dlp
 
-      # 1. Wayback URL かどうかの判定＆オリジナル URL の抽出
-      - name: Prepare RAM URLs
-        id: prep
+      # 4. Mixcloud からトラックを MP3 に変換してダウンロード
+      - name: Download track as MP3
         run: |
-          RAM_INPUT="${{ github.event.inputs.ram_url }}"
-          if [[ "$RAM_INPUT" =~ https?://web.archive.org/web/[0-9]+/(https?://.*) ]]; then
-            ORIG_RAM_URL="${BASH_REMATCH[1]}"
+          TITLE="${{ steps.get_title.outputs.title }}"
+          yt-dlp --no-playlist \
+                 --extract-audio \
+                 --audio-format mp3 \
+                 --output "${TITLE}.%(ext)s" \
+                 "${{ github.event.inputs.mixcloud_url }}"
+
+      # 5. アーティスト画像（サムネイル）をダウンロード
+      - name: Download thumbnail
+        run: |
+          TITLE="${{ steps.get_title.outputs.title }}"
+          yt-dlp --no-playlist \
+                 --skip-download \
+                 --write-thumbnail \
+                 --output "${TITLE}.%(ext)s" \
+                 "${{ github.event.inputs.mixcloud_url }}"
+
+      # 6. ffmpeg で MP3 にカバーアートを埋め込み
+      - name: Embed cover into MP3
+        run: |
+          TITLE="${{ steps.get_title.outputs.title }}"
+          MP3="${TITLE}.mp3"
+          IMG=$(ls "${TITLE}".jpg "${TITLE}".png 2>/dev/null | head -n1)
+          if [ -z "$IMG" ]; then
+            echo "::warning::サムネイルが見つかりません。カバーアートなしでスキップします。"
+            cp "$MP3" "${TITLE}-with-cover.mp3"
           else
-            ORIG_RAM_URL="$RAM_INPUT"
+            ffmpeg -y \
+              -i "$MP3" \
+              -i "$IMG" \
+              -map 0:a -map 1:v \
+              -c copy \
+              -id3v2_version 3 \
+              -metadata:s:v title="Cover" \
+              -metadata:s:v comment="Cover (front)" \
+              "${TITLE}-with-cover.mp3"
           fi
-          echo "orig_ram_url=$ORIG_RAM_URL" >> $GITHUB_ENV
-          echo "use_ram_url=$RAM_INPUT" >> $GITHUB_ENV
-
-      # 2. .ram ダウンロード（直接→Wayback→Memento）
-      - name: Download .ram (direct → Wayback → Memento)
-        id: download_ram
-        run: |
-          RAM_IN="$use_ram_url"
-          RAM_FILE=$(basename "$orig_ram_url")
-          echo "::notice::Attempting direct download → $RAM_FILE"
-          if curl -fSL "$RAM_IN" -o "$RAM_FILE"; then
-            echo "::notice::.ram direct succeeded"
-          else
-            echo "::notice::.ram direct failed, trying Wayback via CDX"
-            CDX=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${orig_ram_url}&output=json")
-            TS=$(echo "$CDX" | jq -r '.[1][1]')
-            if [[ -n "$TS" && "$TS" != "null" ]]; then
-              WB_URL="https://web.archive.org/web/$TS/${orig_ram_url}"
-              curl -fSL "$WB_URL" -o "$RAM_FILE" && echo "::notice::.ram from Wayback succeeded"
-            fi
-          fi
-
-          if [ ! -s "$RAM_FILE" ]; then
-            echo "::notice::.ram Wayback failed, trying Memento Aggregator"
-            MEM=$(curl -s "http://memgator.cs.odu.edu/timemap/json/${orig_ram_url}" | \
-                  jq -r '.mementos.list[].uri' | grep -v web.archive.org)
-            for U in $MEM; do
-              if curl -fSL "$U" -o "$RAM_FILE"; then
-                echo "::notice::.ram from Memento succeeded: $U"
-                break
-              fi
-            done
-          fi
-
-          if [ ! -s "$RAM_FILE" ]; then
-            echo "::error::.ram を取得できませんでした"
-            exit 1
-          fi
-
-          echo "ram_file=$RAM_FILE" >> $GITHUB_ENV
-
-      # 3. 実メディア URL 抽出
-      - name: Extract media URL
-        run: |
-          URL=$(grep -Eo 'https?://[^ ]+' "$ram_file" | head -n1)
-          if [ -z "$URL" ]; then
-            echo "::error::.ram 内にメディア URL がありません"
-            exit 1
-          fi
-          echo "media_url=$URL" >> $GITHUB_ENV
-
-      # 4. .rm 直接ダウンロード
-      - name: Attempt direct download
-        id: direct
-        run: |
-          MF=$(basename "${{ env.media_url }}")
-          if curl -fSL "${{ env.media_url }}" -o "$MF"; then
-            echo "::notice::.rm direct succeeded: $MF"
-            echo "downloaded_file=$MF" >> $GITHUB_ENV
-            echo "success=true" >> $GITHUB_OUTPUT
-          else
-            echo "::notice::.rm direct failed"
-            echo "success=false" >> $GITHUB_OUTPUT
-          fi
-
-      # 5. .rm の Wayback / Memento フォールバック
-      - name: Fallback for media (Wayback → Memento)
-        if: steps.direct.outputs.success == 'false'
-        run: |
-          ORIG_MEDIA="$media_url"
-          if [[ "$media_url" =~ https?://web.archive.org/web/[0-9]+/(https?://.*) ]]; then
-            ORIG_MEDIA="${BASH_REMATCH[1]}"
-          fi
-
-          # Wayback
-          CDX=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${ORIG_MEDIA}&output=json")
-          TS=$(echo "$CDX" | jq -r '.[1][1]')
-          if [[ -n "$TS" && "$TS" != "null" ]]; then
-            WB="https://web.archive.org/web/$TS/${ORIG_MEDIA}"
-            SNAP="$(basename "${ORIG_MEDIA%.*}")-$TS.${ORIG_MEDIA##*.}"
-            curl -fSL "$WB" -o "$SNAP" && echo "::notice::.rm from Wayback → $SNAP" && echo "downloaded_file=$SNAP" >> $GITHUB_ENV && exit 0
-          fi
-
-          # Memento
-          MEM=$(curl -s "http://memgator.cs.odu.edu/timemap/json/${ORIG_MEDIA}" | \
-                jq -r '.mementos.list[].uri' | grep -v web.archive.org)
-          for U in $MEM; do
-            SNAP="$(basename "${ORIG_MEDIA%.*}")-memento.${ORIG_MEDIA##*.}"
-            if curl -fSL "$U" -o "$SNAP"; then
-              echo "::notice::.rm from Memento → $U"
-              echo "downloaded_file=$SNAP" >> $GITHUB_ENV
-              exit 0
-            fi
-          done
-
-          echo "::error::.rm を取得できませんでした"
-          exit 1
-
-      # 6. 全 SNAPSHOT 一括取得（オプション）
-      - name: Download all snapshots with waybackpack
-        if: steps.direct.outputs.success == 'false' && github.event.inputs.use_waybackpack == 'true'
-        run: |
-          waybackpack "${{ env.media_url }}" --timestamp all
 
       # 7. コミット＆プッシュ（オプション）
-      - name: Commit & push recovered media
+      - name: Commit & push MP3
         if: github.event.inputs.push_to_repo == 'true'
+        env:
+          TITLE: ${{ steps.get_title.outputs.title }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add *.ram *.rm *.warc.gz || true
-          git commit -m "Add recovered media from ${{ env.ram_url }}" || echo "No changes"
+          git add "${TITLE}-with-cover.mp3" || true
+          git commit -m "Add Mixcloud MP3 (${TITLE}-with-cover.mp3)" || echo "No changes to commit"
           git push
 
-      # 8. Artifacts にアップロード（push_to_repo = false のとき）
-      - name: Upload recovered files
+      # 8. アーティファクトとしてアップロード（push_to_repo = false のとき）
+      - name: Upload MP3 artifact
         if: github.event.inputs.push_to_repo == 'false'
         uses: actions/upload-artifact@v4
         with:
-          name: recovered-media
-          path: |
-            '*.ram'
-            '*.rm'
-            '*.warc.gz'
+          name: ${{ steps.get_title.outputs.title }}
+          path: "${{ steps.get_title.outputs.title }}-with-cover.mp3"
           retention-days: 7
