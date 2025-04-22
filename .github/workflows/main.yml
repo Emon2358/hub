@@ -5,14 +5,14 @@ on:
   workflow_dispatch:
     inputs:
       ram_url:
-        description: 'ダウンロードしたい .ram ファイルの URL'
+        description: 'ダウンロードしたい .ram ファイルの URL（オリジナル or Wayback URL）'
         required: true
       use_waybackpack:
         description: '全スナップショットを waybackpack で取得する場合は true'
         required: false
         default: 'false'
       push_to_repo:
-        description: 'ダウンロードした音源をリポジトリにコミット＆プッシュする場合は true'
+        description: 'ダウンロードしたメディアをリポジトリにコミット＆プッシュする場合は true'
         required: false
         default: 'false'
 
@@ -20,13 +20,11 @@ jobs:
   recover:
     runs-on: ubuntu-latest
     steps:
-      # 1. リポジトリをチェックアウト（コミット＆プッシュ用に資格情報を保持）
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
           persist-credentials: true
 
-      # 2. jq, waybackpack をインストール
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -34,26 +32,52 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install waybackpack
 
-      # 3. .ram をダウンロード
-      - name: Download .ram
+      - name: Prepare RAM URLs
+        id: prep
         run: |
           RAM_URL="${{ github.event.inputs.ram_url }}"
-          RAM_FILE=$(basename "$RAM_URL")
-          echo "Downloading $RAM_URL → $RAM_FILE"
-          curl -fSL "$RAM_URL" -o "$RAM_FILE"
+          # Wayback URL ならオリジナル URL を抜き出す
+          if [[ "$RAM_URL" =~ https?://web.archive.org/web/[0-9]+/(https?://.*) ]]; then
+            ORIG_RAM_URL="${BASH_REMATCH[1]}"
+          else
+            ORIG_RAM_URL="$RAM_URL"
+          fi
+          echo "orig_ram_url=$ORIG_RAM_URL" >> $GITHUB_ENV
+          echo "use_ram_url=$RAM_URL" >> $GITHUB_ENV
+
+      - name: Download .ram (with Wayback fallback)
+        id: download_ram
+        run: |
+          RAM_URL="$use_ram_url"
+          RAM_FILE=$(basename "$ORIG_RAM_URL")
+          echo "::notice::Attempting direct download of .ram → $RAM_FILE"
+          if curl -fSL "$RAM_URL" -o "$RAM_FILE"; then
+            echo "::notice::Direct .ram download succeeded"
+          else
+            echo "::notice::.ram direct download failed, trying Wayback Machine via CDX API"
+            # オリジナル URL で CDX 検索
+            CDX=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${orig_ram_url}&output=json")
+            TS=$(echo "$CDX" | jq -r '.[1][1]')
+            if [ -z "$TS" ] || [ "$TS" == "null" ]; then
+              echo "::error::Wayback に .ram のスナップショットが見つかりませんでした"
+              exit 1
+            fi
+            SNAP_URL="https://web.archive.org/web/$TS/${orig_ram_url}"
+            echo "::notice::Downloading .ram snapshot: $SNAP_URL → $RAM_FILE"
+            curl -fSL "$SNAP_URL" -o "$RAM_FILE"
+          fi
           echo "ram_file=$RAM_FILE" >> $GITHUB_ENV
 
-      # 4. .ram からメディア URL を抽出
       - name: Extract media URL
         run: |
           MEDIA_URL=$(grep -Eo 'https?://[^ ]+' "$ram_file" | head -n1)
           if [ -z "$MEDIA_URL" ]; then
-            echo "::error::.ram 内に URL が見つかりませんでした"
+            echo "::error::.ram 内にメディア URL が見つかりませんでした"
             exit 1
           fi
+          echo "::notice::Found media URL: $MEDIA_URL"
           echo "media_url=$MEDIA_URL" >> $GITHUB_ENV
 
-      # 5. 直接ダウンロードを試行
       - name: Attempt direct download
         id: direct
         run: |
@@ -67,46 +91,47 @@ jobs:
             echo "success=false" >> $GITHUB_OUTPUT
           fi
 
-      # 6. 直接が失敗なら Wayback Machine 経由で復旧
-      - name: Fallback via Wayback Machine
+      - name: Fallback via Wayback Machine for media
         if: steps.direct.outputs.success == 'false'
         run: |
-          echo "Query CDX API for ${media_url}"
-          cdx=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${media_url}&output=json")
-          TS=$(echo "$cdx" | jq -r '.[1][1]')
+          # .ram と同様にオリジナル URL を扱う
+          MEDIA_ORIG_URL="$media_url"
+          if [[ "$media_url" =~ https?://web.archive.org/web/[0-9]+/(https?://.*) ]]; then
+            MEDIA_ORIG_URL="${BASH_REMATCH[1]}"
+          fi
+          CDX=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${MEDIA_ORIG_URL}&output=json")
+          TS=$(echo "$CDX" | jq -r '.[1][1]')
           if [ -z "$TS" ] || [ "$TS" == "null" ]; then
-            echo "::error::スナップショットが見つかりませんでした"
+            echo "::error::Wayback にメディアのスナップショットが見つかりませんでした"
             exit 1
           fi
-          SNAP_URL="https://web.archive.org/web/$TS/${media_url}"
-          SNAP_FILE="$(basename "${media_url%.*}")-$TS.${media_url##*.}"
-          echo "Downloading snapshot: $SNAP_URL → $SNAP_FILE"
+          SNAP_URL="https://web.archive.org/web/$TS/${MEDIA_ORIG_URL}"
+          SNAP_FILE="$(basename "${MEDIA_ORIG_URL%.*}")-$TS.${MEDIA_ORIG_URL##*.}"
+          echo "::notice::Downloading snapshot: $SNAP_URL → $SNAP_FILE"
           curl -fSL "$SNAP_URL" -o "$SNAP_FILE"
           echo "downloaded_file=$SNAP_FILE" >> $GITHUB_ENV
 
-      # 7. 全スナップショットを waybackpack で取得（オプション）
       - name: Download all snapshots with waybackpack
         if: steps.direct.outputs.success == 'false' && github.event.inputs.use_waybackpack == 'true'
         run: |
           waybackpack "${{ env.media_url }}" --timestamp all
 
-      # 8. リポジトリにコミット＆プッシュ（オプション）
       - name: Commit & push recovered media
         if: github.event.inputs.push_to_repo == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add *.rm *.warc.gz || true
-          git commit -m "Add recovered media from ${{ github.event.inputs.ram_url }}" || echo "No changes to commit"
+          git add *.ram *.rm *.warc.gz || true
+          git commit -m "Add recovered media from ${{ env.ram_url }}" || echo "No new files"
           git push
 
-      # 9. Artifacts にアップロード（push_to_repo が false のとき）
       - name: Upload recovered files
         if: github.event.inputs.push_to_repo == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: recovered-media
           path: |
+            '*.ram'
             '*.rm'
             '*.warc.gz'
           retention-days: 7
