@@ -1,19 +1,14 @@
-# .github/workflows/download-mixcloud-mp3.yml
-name: Download Mixcloud Track as MP3 with Cover
+name: Download Mixcloud MP3 and Commit
 
 on:
   workflow_dispatch:
     inputs:
       mixcloud_url:
-        description: 'Mixcloud でダウンロードしたいトラックの URL'
+        description: 'Mixcloud トラックの URL を入力'
         required: true
-      push_to_repo:
-        description: '生成した MP3 をリポジトリにコミット＆プッシュする場合は true'
-        required: false
-        default: 'false'
 
 jobs:
-  download:
+  download-and-commit:
     runs-on: ubuntu-latest
     steps:
       # 1. リポジトリをチェックアウト
@@ -23,78 +18,37 @@ jobs:
           persist-credentials: true
 
       # 2. yt-dlp と ffmpeg をインストール
-      - name: Install dependencies
+      - name: Install yt-dlp and ffmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-          python3 -m pip install --upgrade pip
-          pip install yt-dlp
+          pip install -U yt-dlp
 
-      # 3. タイトルを取得して出力に保存
-      - name: Extract track title
+      # 3. Mixcloud からタイトルを取得
+      - name: Get track title
         id: get_title
         run: |
           TITLE=$(yt-dlp --no-playlist --get-title "${{ github.event.inputs.mixcloud_url }}")
           echo "title=$TITLE" >> $GITHUB_OUTPUT
 
-      # 4. Mixcloud から MP3 に変換してダウンロード
-      - name: Download track as MP3
+      # 4. Mixcloud から MP3 をダウンロード
+      - name: Download MP3 from Mixcloud
         run: |
           TITLE="${{ steps.get_title.outputs.title }}"
-          yt-dlp --no-playlist \
-                 --extract-audio \
-                 --audio-format mp3 \
-                 --output "${TITLE}.%(ext)s" \
-                 "${{ github.event.inputs.mixcloud_url }}"
+          yt-dlp \
+            --no-playlist \
+            --extract-audio \
+            --audio-format mp3 \
+            --output "${TITLE}.%(ext)s" \
+            "${{ github.event.inputs.mixcloud_url }}"
 
-      # 5. サムネイルを取得
-      - name: Download thumbnail
-        run: |
-          TITLE="${{ steps.get_title.outputs.title }}"
-          yt-dlp --no-playlist \
-                 --skip-download \
-                 --write-thumbnail \
-                 --output "${TITLE}.%(ext)s" \
-                 "${{ github.event.inputs.mixcloud_url }}"
-
-      # 6. MP3 にカバーアートを埋め込む
-      - name: Embed cover into MP3
-        run: |
-          TITLE="${{ steps.get_title.outputs.title }}"
-          MP3="${TITLE}.mp3"
-          IMG=$(ls "${TITLE}".jpg "${TITLE}".png 2>/dev/null | head -n1)
-          if [ -z "$IMG" ]; then
-            echo "::warning::サムネイルが見つかりません。カバーアートなしでスキップします。"
-            cp "$MP3" "${TITLE}-with-cover.mp3"
-          else
-            ffmpeg -y \
-              -i "$MP3" \
-              -i "$IMG" \
-              -map 0:a -map 1:v \
-              -c copy \
-              -id3v2_version 3 \
-              -metadata:s:v title="Cover" \
-              -metadata:s:v comment="Cover (front)" \
-              "${TITLE}-with-cover.mp3"
-          fi
-
-      # 7. リポジトリへコミット＆プッシュ（オプション）
-      - name: Commit & push MP3
-        if: github.event.inputs.push_to_repo == 'true'
+      # 5. コミット＆プッシュ
+      - name: Commit and push MP3 to repository
         env:
           TITLE: ${{ steps.get_title.outputs.title }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${TITLE}-with-cover.mp3" || true
-          git commit -m "Add Mixcloud MP3 (${TITLE}-with-cover.mp3)" || echo "No changes to commit"
+          git add "${TITLE}.mp3"
+          git commit -m "Add downloaded MP3: ${TITLE}.mp3"
           git push
-
-      # 8. アーティファクトとしてアップロード
-      - name: Upload MP3 artifact
-        if: github.event.inputs.push_to_repo == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.get_title.outputs.title }}
-          path: "${{ steps.get_title.outputs.title }}-with-cover.mp3"
-          retention-days: 7
