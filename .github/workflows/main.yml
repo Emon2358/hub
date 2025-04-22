@@ -16,20 +16,13 @@ jobs:
   download:
     runs-on: ubuntu-latest
     steps:
-      # 1. リポジトリをチェックアウト（コミット用に認証情報保持）
+      # 1. リポジトリをチェックアウト
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
           persist-credentials: true
 
-      # 2. タイトルを取得して出力用に保存
-      - name: Extract track title
-        id: get_title
-        run: |
-          TITLE=$(yt-dlp --no-playlist --get-title "${{ github.event.inputs.mixcloud_url }}")
-          echo "title=$TITLE" >> $GITHUB_OUTPUT
-
-      # 3. yt-dlp と ffmpeg をインストール
+      # 2. yt-dlp と ffmpeg をインストール
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -37,7 +30,14 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install yt-dlp
 
-      # 4. Mixcloud からトラックを MP3 に変換してダウンロード
+      # 3. タイトルを取得して出力に保存
+      - name: Extract track title
+        id: get_title
+        run: |
+          TITLE=$(yt-dlp --no-playlist --get-title "${{ github.event.inputs.mixcloud_url }}")
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+
+      # 4. Mixcloud から MP3 に変換してダウンロード
       - name: Download track as MP3
         run: |
           TITLE="${{ steps.get_title.outputs.title }}"
@@ -47,7 +47,7 @@ jobs:
                  --output "${TITLE}.%(ext)s" \
                  "${{ github.event.inputs.mixcloud_url }}"
 
-      # 5. アーティスト画像（サムネイル）をダウンロード
+      # 5. サムネイルを取得
       - name: Download thumbnail
         run: |
           TITLE="${{ steps.get_title.outputs.title }}"
@@ -57,7 +57,7 @@ jobs:
                  --output "${TITLE}.%(ext)s" \
                  "${{ github.event.inputs.mixcloud_url }}"
 
-      # 6. ffmpeg で MP3 にカバーアートを埋め込み
+      # 6. MP3 にカバーアートを埋め込む
       - name: Embed cover into MP3
         run: |
           TITLE="${{ steps.get_title.outputs.title }}"
@@ -78,7 +78,7 @@ jobs:
               "${TITLE}-with-cover.mp3"
           fi
 
-      # 7. コミット＆プッシュ（オプション）
+      # 7. リポジトリへコミット＆プッシュ（オプション）
       - name: Commit & push MP3
         if: github.event.inputs.push_to_repo == 'true'
         env:
@@ -90,7 +90,7 @@ jobs:
           git commit -m "Add Mixcloud MP3 (${TITLE}-with-cover.mp3)" || echo "No changes to commit"
           git push
 
-      # 8. アーティファクトとしてアップロード（push_to_repo = false のとき）
+      # 8. アーティファクトとしてアップロード
       - name: Upload MP3 artifact
         if: github.event.inputs.push_to_repo == 'false'
         uses: actions/upload-artifact@v4
