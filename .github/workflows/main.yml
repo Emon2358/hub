@@ -1,0 +1,100 @@
+# .github/workflows/recover-realmedia.yml
+name: Recover RealMedia from .ram
+
+on:
+  workflow_dispatch:
+    inputs:
+      ram_url:
+        description: 'ダウンロードしたい .ram ファイルの URL'
+        required: true
+      use_waybackpack:
+        description: '全スナップショットを waybackpack で取得する場合は true'
+        required: false
+        default: 'false'
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      # （オプション）リポジトリをチェックアウト
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # Python と jq を準備
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          python3 -m pip install --upgrade pip
+          pip install waybackpack
+
+      # .ram ファイルをダウンロード
+      - name: Download .ram
+        run: |
+          RAM_URL="${{ github.event.inputs.ram_url }}"
+          RAM_FILE=$(basename "$RAM_URL")
+          echo "Downloading $RAM_URL → $RAM_FILE"
+          curl -fSL "$RAM_URL" -o "$RAM_FILE"
+          echo "ram_file=$RAM_FILE" >> $GITHUB_ENV
+
+      # .ram をパースして .rm/.ra の実 URL を抽出
+      - name: Extract media URL
+        run: |
+          echo "Parsing .ram: $ram_file"
+          MEDIA_URL=$(grep -Eo 'https?://[^ ]+' "$ram_file" | head -n1)
+          if [ -z "$MEDIA_URL" ]; then
+            echo "::error::.ram ファイル内に URL が見つかりませんでした"
+            exit 1
+          fi
+          echo "Found media URL: $MEDIA_URL"
+          echo "media_url=$MEDIA_URL" >> $GITHUB_ENV
+
+      # 直接ダウンロードを試みる
+      - name: Attempt direct download
+        id: direct
+        run: |
+          MEDIA_URL="${{ env.media_url }}"
+          MEDIA_FILE=$(basename "$MEDIA_URL")
+          if curl -fSL "$MEDIA_URL" -o "$MEDIA_FILE"; then
+            echo "::notice::Direct download succeeded: $MEDIA_FILE"
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "output_file=$MEDIA_FILE" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Direct download failed, will fallback to Wayback Machine"
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      # direct が失敗した場合は CDX API でタイムスタンプを取得→スナップショットを復元
+      - name: Fallback via Wayback Machine
+        if: steps.direct.outputs.success == 'false'
+        run: |
+          echo "Query CDX API for snapshots of $media_url"
+          cdx_json=$(curl -s "https://web.archive.org/cdx/search/cdx?url=${media_url}&output=json")
+          # 最も新しいキャプチャ（2行目のタイムスタンプ）
+          TIMESTAMP=$(echo "$cdx_json" | jq -r '.[1][1]')
+          if [ -z "$TIMESTAMP" ] || [ "$TIMESTAMP" == "null" ]; then
+            echo "::error::Wayback にスナップショットが見つかりませんでした"
+            exit 1
+          fi
+          SNAP_URL="https://web.archive.org/web/$TIMESTAMP/$media_url"
+          SNAP_FILE="$(basename "$media_url" .rm)-$TIMESTAMP.rm"
+          echo "Downloading snapshot: $SNAP_URL → $SNAP_FILE"
+          curl -fSL "$SNAP_URL" -o "$SNAP_FILE"
+          echo "::notice::Recovered snapshot as $SNAP_FILE"
+          echo "output_file=$SNAP_FILE" >> $GITHUB_ENV
+
+      # 必要に応じて waybackpack で全スナップショットを取得
+      - name: Download all snapshots with waybackpack
+        if: steps.direct.outputs.success == 'false' && github.event.inputs.use_waybackpack == 'true'
+        run: |
+          echo "Downloading ALL snapshots for $media_url via waybackpack"
+          waybackpack "$media_url" --timestamp all
+
+      # 最後に recovered-media という名前で成果物をアップロード
+      - name: Upload recovered files
+        uses: actions/upload-artifact@v3
+        with:
+          name: recovered-media
+          path: |
+            *.rm
+            *.warc.gz
